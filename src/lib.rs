@@ -109,10 +109,7 @@ use alloc::{
     vec::Vec,
 };
 
-#[cfg(feature = "hpke-test-prng")]
 use hpke_rs_crypto::HpkeTestRng;
-#[cfg(not(feature = "hpke-test-prng"))]
-use hpke_rs_crypto::TryRng;
 use hpke_rs_crypto::{
     types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm},
     HpkeCrypto,
@@ -833,17 +830,25 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
 
     #[inline]
     pub(crate) fn random(&mut self, len: usize) -> Result<Vec<u8>, HpkeError> {
-        let prng = &mut self.prng;
         let mut out = vec![0u8; len];
 
-        #[cfg(feature = "hpke-test-prng")]
-        prng.try_fill_test_bytes(&mut out)
-            .map_err(|_| HpkeError::InsufficientRandomness)?;
-        #[cfg(not(feature = "hpke-test-prng"))]
-        prng.try_fill_bytes(&mut out)
-            .map_err(|_| HpkeError::InsufficientRandomness)?;
+        // Extraction patch: delegate to a small helper to keep this function
+        // simple in extracted IR. Error semantics are unchanged: any RNG
+        // failure maps to HpkeError::InsufficientRandomness.
+        self.fill_random_bytes(&mut out)?;
 
         Ok(out)
+    }
+
+    #[inline]
+    fn fill_random_bytes(&mut self, out: &mut [u8]) -> Result<(), HpkeError> {
+        // Extraction patch: use the HpkeTestRng extension trait path directly
+        // to avoid problematic TryRng dispatch in Aeneas. Provider behavior is
+        // equivalent in non-deterministic mode (fills output or errors).
+        if self.prng.try_fill_test_bytes(out).is_err() {
+            return Err(HpkeError::InsufficientRandomness);
+        }
+        Ok(())
     }
 
     /// Get the rng.
@@ -935,9 +940,10 @@ impl PartialEq for HpkePrivateKey {
 #[cfg(not(feature = "hazmat"))]
 impl core::fmt::Debug for HpkePrivateKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
-        f.debug_struct("HpkePrivateKey")
-            .field("value", &"***")
-            .finish()
+        // Extraction patch: keep non-hazmat redaction semantics while avoiding
+        // a debug-builder path that previously triggered an Aeneas internal
+        // error on this impl.
+        f.write_str("HpkePrivateKey(*** )")
     }
 }
 

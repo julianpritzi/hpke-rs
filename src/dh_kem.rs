@@ -76,6 +76,11 @@ pub(super) fn derive_key_pair<Crypto: HpkeCrypto>(
                 _ => 0xFF,
             };
             let mut ctr = 0u8;
+            // Extraction patch: keep the same rejection-sampling behavior but
+            // avoid returning from inside the loop, which Aeneas does not
+            // support well. We accumulate a validated key and return after the
+            // loop. Success/failure conditions are unchanged.
+            let mut validated_sk: Option<Vec<u8>> = None;
             // Do rejection sampling trying to find a valid key.
             // It is expected that there aren't too many iterations and that
             // the loop will always terminate.
@@ -91,16 +96,25 @@ pub(super) fn derive_key_pair<Crypto: HpkeCrypto>(
                 if let Ok(mut sk) = candidate {
                     sk[0] &= bitmask;
                     if let Ok(sk) = Crypto::dh_validate_sk(alg, &sk) {
-                        break PrivateKey(sk);
+                        validated_sk = Some(sk);
+                        break;
                     }
                 }
                 if ctr == u8::MAX {
-                    // If we get here we lost. This should never happen.
+                    break;
+                }
+                ctr += 1;
+            }
+
+            // Equivalent to the previous in-loop early return: if no candidate
+            // validated before ctr reached u8::MAX, return the same error.
+            match validated_sk {
+                Some(sk) => PrivateKey(sk),
+                None => {
                     return Err(Error::CryptoLibraryError(
                         "Unable to generate a valid private key".to_string(),
                     ));
                 }
-                ctr += 1;
             }
         }
         _ => {
