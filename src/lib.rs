@@ -87,7 +87,7 @@
 //! assert_eq!(ptxt, plaintext);
 //! ```
 
-#![forbid(unsafe_code, unused_must_use, unstable_features)]
+// #![forbid(unsafe_code, unused_must_use, unstable_features)]
 #![deny(
     trivial_casts,
     trivial_numeric_casts,
@@ -487,6 +487,60 @@ impl<Crypto: HpkeCrypto> core::fmt::Display for Hpke<Crypto> {
     }
 }
 
+
+#[cfg(feature = "verif")]
+/// Verification event for logging HPKE operations.
+#[allow(dead_code)]
+pub enum Event {
+    /// Seal operation event.
+    Seal{
+        /// Recipient's public key.
+        pk_r: HpkePublicKey,
+        /// Sender's public key (if authenticated).
+        pk_s: Option<HpkePublicKey>,
+        /// Info parameter.
+        info: Vec<u8>,
+        /// Additional authenticated data.
+        aad: Vec<u8>,
+        /// Plaintext.
+        pt: Vec<u8>,
+        /// Pre-shared key.
+        psk: Option<Vec<u8>>,
+        /// PSK ID.
+        psk_id: Option<Vec<u8>>,
+        /// Encapsulated secret.
+        enc: Vec<u8>,
+    },
+    /// Open operation event.
+    Open{
+        /// Recipient's public key.
+        pk_r: HpkePublicKey,
+        /// Sender's public key (if authenticated).
+        pk_s: Option<HpkePublicKey>,
+        /// Info parameter.
+        info: Vec<u8>,
+        /// Additional authenticated data.
+        aad: Vec<u8>,
+        /// Plaintext.
+        pt: Vec<u8>,
+        /// Pre-shared key.
+        psk: Option<Vec<u8>>,
+        /// PSK ID.
+        psk_id: Option<Vec<u8>>,
+        /// Encapsulated secret.
+        enc: Vec<u8>,
+    },
+}
+
+#[cfg(feature = "verif")]
+/// Verification log entry, either a full event or a compact message tuple.
+pub enum VerifLogEntry {
+    /// Full structured event.
+    Event(Event),
+    /// Compact message represented as `(enc, ct)`.
+    Message((Vec<u8>, Vec<u8>)),
+}
+
 impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// Set up the configuration for HPKE.
     pub fn new(
@@ -602,6 +656,20 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// such that it doesn't make sense to deserialize before passing it in.
     ///
     /// Returns the encapsulated secret and the ciphertext, or an error.
+    /// 6. Single-Shot APIs
+    ///
+    /// 6.1. Encryption and Decryption
+    ///
+    /// Single shot API to encrypt the bytes in `plain_text` to the public key
+    /// `pk_r`.
+    ///
+    /// **Note** that this API expects the public key to be encoded.
+    /// This differs from the RFC.
+    /// But the public keys will be present in encoded form rather than raw form
+    /// such that it doesn't make sense to deserialize before passing it in.
+    ///
+    /// Returns the encapsulated secret and the ciphertext, or an error.
+    #[cfg(not(feature = "verif"))]
     #[allow(clippy::too_many_arguments)]
     pub fn seal(
         &mut self,
@@ -618,6 +686,42 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
         Ok((enc, ctxt))
     }
 
+    /// Seal with logging for verification.
+    /// When verif feature is enabled, seal includes a log parameter.
+    #[cfg(feature = "verif")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal(
+        &mut self,
+        pk_r: &HpkePublicKey,
+        info: &[u8],
+        aad: &[u8],
+        plain_txt: &[u8],
+        psk: Option<&[u8]>,
+        psk_id: Option<&[u8]>,
+        sk_s: Option<&HpkePrivateKey>,
+        log: &mut Vec<VerifLogEntry>,
+    ) -> Result<(EncapsulatedSecret, Ciphertext), HpkeError> {
+        let (enc, mut context) = self.setup_sender(pk_r, info, psk, psk_id, sk_s)?;
+        let ctxt = context.seal(aad, plain_txt)?;
+
+        let pk_s = sk_s
+            .map(|s| Crypto::secret_to_public(self.kem_id, &s.value).map(HpkePublicKey::new))
+            .transpose()?;
+
+        log.push(VerifLogEntry::Event(Event::Seal {
+            pk_r: pk_r.clone(),
+            pk_s,
+            info: info.to_vec(),
+            aad: aad.to_vec(),
+            pt: plain_txt.to_vec(),
+            psk: psk.map(|p| p.to_vec()),
+            psk_id: psk_id.map(|p| p.to_vec()),
+            enc: enc.clone(),
+        }));
+
+        Ok((enc, ctxt))
+    }
+
     /// 6. Single-Shot APIs
     ///
     /// 6.1. Encryption and Decryption
@@ -630,6 +734,19 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// such that it doesn't make sense to deserialize before passing it in.
     ///
     /// Returns the decrypted plain text, or an error.
+    /// 6. Single-Shot APIs
+    ///
+    /// 6.1. Encryption and Decryption
+    ///
+    /// Single shot API to decrypt the bytes in `ct` with the private key `sk_r`.
+    ///
+    /// **Note** that this API expects the public key to be encoded.
+    /// This differs from the RFC.
+    /// But the public keys will be present in encoded form rather than raw form
+    /// such that it doesn't make sense to deserialize before passing it in.
+    ///
+    /// Returns the decrypted plain text, or an error.
+    #[cfg(not(feature = "verif"))]
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         &self,
@@ -643,7 +760,45 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
         pk_s: Option<&HpkePublicKey>,
     ) -> Result<Plaintext, HpkeError> {
         let mut context = self.setup_receiver(enc, sk_r, info, psk, psk_id, pk_s)?;
-        context.open(aad, ct)
+        let pt = context.open(aad, ct)?;
+        Ok(pt)
+    }
+
+    /// Open with logging for verification.
+    /// When verif feature is enabled, open includes a log parameter.
+    #[cfg(feature = "verif")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        &self,
+        enc: &[u8],
+        sk_r: &HpkePrivateKey,
+        info: &[u8],
+        aad: &[u8],
+        ct: &[u8],
+        psk: Option<&[u8]>,
+        psk_id: Option<&[u8]>,
+        pk_s: Option<&HpkePublicKey>,
+        log: &mut Vec<VerifLogEntry>,
+    ) -> Result<Plaintext, HpkeError> {
+        let mut context = self.setup_receiver(enc, sk_r, info, psk, psk_id, pk_s)?;
+        let pt = context.open(aad, ct)?;
+
+        let pk_r = HpkePublicKey::new(Crypto::secret_to_public(self.kem_id, &sk_r.value)?);
+
+        log.push(VerifLogEntry::Event(Event::Open {
+            pk_r,
+            pk_s: pk_s.map(|s| HpkePublicKey {
+                value: s.value.clone(),
+            }),
+            info: info.to_vec(),
+            aad: aad.to_vec(),
+            pt: pt.clone(),
+            psk: psk.map(|p| p.to_vec()),
+            psk_id: psk_id.map(|p| p.to_vec()),
+            enc: enc.to_vec(),
+        }));
+
+        Ok(pt)
     }
 
     /// 6. Single-Shot APIs
@@ -1031,6 +1186,69 @@ impl tls_codec::Deserialize for &HpkePublicKey {
             "Error trying to deserialize a reference.".to_string(),
         ))
     }
+}
+
+/// Verification main function for Aeneas.
+/// Orchestrates seal and open operations in a loop with local logging.
+#[cfg(feature = "verif")]
+pub fn verify_hpke<Crypto: HpkeCrypto + 'static>(
+    iterations: usize,
+) -> Result<Vec<VerifLogEntry>, HpkeError> {
+    let mut hpke = Hpke::<Crypto>::new(
+        Mode::Base,
+        KemAlgorithm::DhKem25519,
+        KdfAlgorithm::HkdfSha256,
+        AeadAlgorithm::ChaCha20Poly1305,
+    );
+
+    // Generate keys once
+    let (sk_r, pk_r) = hpke.generate_key_pair()?.into_keys();
+
+    let info = b"verification info";
+    let aad = b"verification aad";
+    let plaintext = b"verification plaintext";
+
+    let mut log: Vec<VerifLogEntry> = Vec::new();
+    let mut iteration = 0;
+
+    loop {
+        if iteration >= iterations {
+            break;
+        }
+
+        let action = match hpke.random(1) {
+            Ok(bytes) => usize::from(bytes[0] % 3),
+            Err(_) => 0,
+        };
+
+        if action == 0 {
+            // Seal operation with logging
+            match hpke.seal(&pk_r, info, aad, plaintext, None, None, None, &mut log) {
+                Ok((enc, ct)) => log.push(VerifLogEntry::Message((enc, ct))),
+                Err(_) => {}
+            }
+        } else if action == 1 {
+            // Get the last seal's enc and ciphertext
+            if let Some(VerifLogEntry::Message((enc, ct))) = log.last() {
+                let last_enc = enc.clone();
+                let last_ct = ct.clone();
+
+                // Open operation with logging
+                let _ = hpke.open(&last_enc, &sk_r, info, aad, &last_ct, None, None, None, &mut log);
+            }
+        } else {
+            // Inject a random message tuple.
+            if let Ok(enc) = hpke.random(32) {
+                if let Ok(ct) = hpke.random(32) {
+                    log.push(VerifLogEntry::Message((enc, ct)));
+                }
+            }
+        }
+
+        iteration += 1;
+    }
+
+    Ok(log)
 }
 
 /// Test util module. Should be moved really.

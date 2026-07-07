@@ -25,7 +25,7 @@ hpke-rs-rust-crypto = { version = "0.6.1", path = "./rust_crypto_provider", defa
 hpke-rs-libcrux = { version = "0.6.1", path = "./libcrux_provider", default-features = false, optional = true }
 
 [features]
-default = []
+default = [ "verif" ]
 std = [
     "hpke-rs-crypto/std",
     "hpke-rs-rust-crypto?/std",
@@ -38,6 +38,7 @@ libcrux = ["dep:hpke-rs-libcrux"]
 libcrux-rustcrypto-p-curves = ["hpke-rs-libcrux?/rustcrypto-p-curves"]
 experimental = ["hpke-rs-rust-crypto?/experimental"]
 draft-connolly-cfrg-hpke-mlkem = ["hpke-rs-libcrux?/draft-connolly-cfrg-hpke-mlkem"]
+verif = ["std"]
 
 hpke-test = ["std"]
 hpke-test-prng = [
