@@ -460,6 +460,10 @@ pub struct Hpke<Crypto: 'static + HpkeCrypto> {
     kdf_id: KdfAlgorithm,
     aead_id: AeadAlgorithm,
     prng: Crypto::HpkePrng,
+    /// Verification event log. Only present under the `verif` feature.
+    #[cfg(feature = "verif")]
+    #[zeroize(skip)]
+    log: Vec<Event>,
 }
 
 impl<Crypto: 'static + HpkeCrypto> Clone for Hpke<Crypto> {
@@ -470,6 +474,8 @@ impl<Crypto: 'static + HpkeCrypto> Clone for Hpke<Crypto> {
             kdf_id: self.kdf_id,
             aead_id: self.aead_id,
             prng: Crypto::prng(),
+            #[cfg(feature = "verif")]
+            log: self.log.clone(),
         }
     }
 }
@@ -490,55 +496,72 @@ impl<Crypto: HpkeCrypto> core::fmt::Display for Hpke<Crypto> {
 
 #[cfg(feature = "verif")]
 /// Verification event for logging HPKE operations.
-#[allow(dead_code)]
+///
+/// Mirrors the Lean `Protocols.HPKE_FULL.HpkeFullEvent` type: every event records
+/// the HPKE `mode`, the acting principal's *own secret key*, the *peer's public
+/// key*, the encapsulation `enc`, and the payload (plaintext or exported secret).
+/// Sender authentication only exists in the `Auth` / `AuthPsk` modes, so the
+/// sender's key is carried as an `Option` (`Some` in the authenticated modes,
+/// `None` in `Base` / `Psk`). Secret keys are stored as raw bytes, matching the
+/// byte-carrier representation used on the Lean side.
+#[derive(Debug, Clone)]
 pub enum Event {
-    /// Seal operation event.
-    Seal{
+    /// The sender completed `seal` in `mode`, producing encapsulation `enc` for
+    /// plaintext `pt`. (`HpkeFullEvent.sealed`.)
+    Sealed {
+        /// HPKE mode.
+        mode: Mode,
+        /// Sender's own secret key (authenticated modes only).
+        sender_sk: Option<Vec<u8>>,
         /// Recipient's public key.
-        pk_r: HpkePublicKey,
-        /// Sender's public key (if authenticated).
-        pk_s: Option<HpkePublicKey>,
-        /// Info parameter.
-        info: Vec<u8>,
-        /// Additional authenticated data.
-        aad: Vec<u8>,
-        /// Plaintext.
-        pt: Vec<u8>,
-        /// Pre-shared key.
-        psk: Option<Vec<u8>>,
-        /// PSK ID.
-        psk_id: Option<Vec<u8>>,
+        recipient_pk: HpkePublicKey,
         /// Encapsulated secret.
         enc: Vec<u8>,
-    },
-    /// Open operation event.
-    Open{
-        /// Recipient's public key.
-        pk_r: HpkePublicKey,
-        /// Sender's public key (if authenticated).
-        pk_s: Option<HpkePublicKey>,
-        /// Info parameter.
-        info: Vec<u8>,
-        /// Additional authenticated data.
-        aad: Vec<u8>,
         /// Plaintext.
         pt: Vec<u8>,
-        /// Pre-shared key.
-        psk: Option<Vec<u8>>,
-        /// PSK ID.
-        psk_id: Option<Vec<u8>>,
+    },
+    /// The recipient completed `open` in `mode`, recovering plaintext `pt` from
+    /// encapsulation `enc`. (`HpkeFullEvent.opened`.)
+    Opened {
+        /// HPKE mode.
+        mode: Mode,
+        /// Recipient's own secret key.
+        recipient_sk: Vec<u8>,
+        /// Sender's public key (authenticated modes only).
+        sender_pk: Option<HpkePublicKey>,
         /// Encapsulated secret.
         enc: Vec<u8>,
+        /// Plaintext.
+        pt: Vec<u8>,
     },
-}
-
-#[cfg(feature = "verif")]
-/// Verification log entry, either a full event or a compact message tuple.
-pub enum VerifLogEntry {
-    /// Full structured event.
-    Event(Event),
-    /// Compact message represented as `(enc, ct)`.
-    Message((Vec<u8>, Vec<u8>)),
+    /// The sender completed `send_export` in `mode`, producing encapsulation
+    /// `enc` and exported secret `exported`. (`HpkeFullEvent.sentExport`.)
+    SentExport {
+        /// HPKE mode.
+        mode: Mode,
+        /// Sender's own secret key (authenticated modes only).
+        sender_sk: Option<Vec<u8>>,
+        /// Recipient's public key.
+        recipient_pk: HpkePublicKey,
+        /// Encapsulated secret.
+        enc: Vec<u8>,
+        /// Exported secret.
+        exported: Vec<u8>,
+    },
+    /// The recipient completed `receiver_export` in `mode`, recovering exported
+    /// secret `exported` from encapsulation `enc`. (`HpkeFullEvent.receivedExport`.)
+    ReceivedExport {
+        /// HPKE mode.
+        mode: Mode,
+        /// Recipient's own secret key.
+        recipient_sk: Vec<u8>,
+        /// Sender's public key (authenticated modes only).
+        sender_pk: Option<HpkePublicKey>,
+        /// Encapsulated secret.
+        enc: Vec<u8>,
+        /// Exported secret.
+        exported: Vec<u8>,
+    },
 }
 
 impl<Crypto: HpkeCrypto> Hpke<Crypto> {
@@ -555,6 +578,8 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
             kdf_id,
             aead_id,
             prng: Crypto::prng(),
+            #[cfg(feature = "verif")]
+            log: Vec::new(),
         }
     }
 
@@ -669,7 +694,9 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// such that it doesn't make sense to deserialize before passing it in.
     ///
     /// Returns the encapsulated secret and the ciphertext, or an error.
-    #[cfg(not(feature = "verif"))]
+    ///
+    /// When the `verif` feature is enabled, a `Seal` event is appended to the
+    /// instance's event log.
     #[allow(clippy::too_many_arguments)]
     pub fn seal(
         &mut self,
@@ -683,41 +710,17 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     ) -> Result<(EncapsulatedSecret, Ciphertext), HpkeError> {
         let (enc, mut context) = self.setup_sender(pk_r, info, psk, psk_id, sk_s)?;
         let ctxt = context.seal(aad, plain_txt)?;
-        Ok((enc, ctxt))
-    }
 
-    /// Seal with logging for verification.
-    /// When verif feature is enabled, seal includes a log parameter.
-    #[cfg(feature = "verif")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn seal(
-        &mut self,
-        pk_r: &HpkePublicKey,
-        info: &[u8],
-        aad: &[u8],
-        plain_txt: &[u8],
-        psk: Option<&[u8]>,
-        psk_id: Option<&[u8]>,
-        sk_s: Option<&HpkePrivateKey>,
-        log: &mut Vec<VerifLogEntry>,
-    ) -> Result<(EncapsulatedSecret, Ciphertext), HpkeError> {
-        let (enc, mut context) = self.setup_sender(pk_r, info, psk, psk_id, sk_s)?;
-        let ctxt = context.seal(aad, plain_txt)?;
-
-        let pk_s = sk_s
-            .map(|s| Crypto::secret_to_public(self.kem_id, &s.value).map(HpkePublicKey::new))
-            .transpose()?;
-
-        log.push(VerifLogEntry::Event(Event::Seal {
-            pk_r: pk_r.clone(),
-            pk_s,
-            info: info.to_vec(),
-            aad: aad.to_vec(),
-            pt: plain_txt.to_vec(),
-            psk: psk.map(|p| p.to_vec()),
-            psk_id: psk_id.map(|p| p.to_vec()),
-            enc: enc.clone(),
-        }));
+        #[cfg(feature = "verif")]
+        {
+            self.log.push(Event::Sealed {
+                mode: self.mode,
+                sender_sk: sk_s.map(|s| s.value.clone()),
+                recipient_pk: pk_r.clone(),
+                enc: enc.clone(),
+                pt: plain_txt.to_vec(),
+            });
+        }
 
         Ok((enc, ctxt))
     }
@@ -746,10 +749,12 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// such that it doesn't make sense to deserialize before passing it in.
     ///
     /// Returns the decrypted plain text, or an error.
-    #[cfg(not(feature = "verif"))]
+    ///
+    /// When the `verif` feature is enabled, an `Open` event is appended to the
+    /// instance's event log.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        &self,
+        &mut self,
         enc: &[u8],
         sk_r: &HpkePrivateKey,
         info: &[u8],
@@ -761,42 +766,17 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     ) -> Result<Plaintext, HpkeError> {
         let mut context = self.setup_receiver(enc, sk_r, info, psk, psk_id, pk_s)?;
         let pt = context.open(aad, ct)?;
-        Ok(pt)
-    }
 
-    /// Open with logging for verification.
-    /// When verif feature is enabled, open includes a log parameter.
-    #[cfg(feature = "verif")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn open(
-        &self,
-        enc: &[u8],
-        sk_r: &HpkePrivateKey,
-        info: &[u8],
-        aad: &[u8],
-        ct: &[u8],
-        psk: Option<&[u8]>,
-        psk_id: Option<&[u8]>,
-        pk_s: Option<&HpkePublicKey>,
-        log: &mut Vec<VerifLogEntry>,
-    ) -> Result<Plaintext, HpkeError> {
-        let mut context = self.setup_receiver(enc, sk_r, info, psk, psk_id, pk_s)?;
-        let pt = context.open(aad, ct)?;
-
-        let pk_r = HpkePublicKey::new(Crypto::secret_to_public(self.kem_id, &sk_r.value)?);
-
-        log.push(VerifLogEntry::Event(Event::Open {
-            pk_r,
-            pk_s: pk_s.map(|s| HpkePublicKey {
-                value: s.value.clone(),
-            }),
-            info: info.to_vec(),
-            aad: aad.to_vec(),
-            pt: pt.clone(),
-            psk: psk.map(|p| p.to_vec()),
-            psk_id: psk_id.map(|p| p.to_vec()),
-            enc: enc.to_vec(),
-        }));
+        #[cfg(feature = "verif")]
+        {
+            self.log.push(Event::Opened {
+                mode: self.mode,
+                recipient_sk: sk_r.value.clone(),
+                sender_pk: pk_s.cloned(),
+                enc: enc.to_vec(),
+                pt: pt.clone(),
+            });
+        }
 
         Ok(pt)
     }
@@ -815,6 +795,9 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     ///
     /// Returns the encapsulated secret and the exporter secret for the given
     /// exporter context and length.
+    ///
+    /// When the `verif` feature is enabled, a `SentExport` event is appended to
+    /// the instance's event log.
     #[allow(clippy::too_many_arguments)]
     pub fn send_export(
         &mut self,
@@ -827,7 +810,20 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
         length: usize,
     ) -> Result<(EncapsulatedSecret, Vec<u8>), HpkeError> {
         let (enc, context) = self.setup_sender(pk_r, info, psk, psk_id, sk_s)?;
-        Ok((enc, context.export(exporter_context, length)?))
+        let exported = context.export(exporter_context, length)?;
+
+        #[cfg(feature = "verif")]
+        {
+            self.log.push(Event::SentExport {
+                mode: self.mode,
+                sender_sk: sk_s.map(|s| s.value.clone()),
+                recipient_pk: pk_r.clone(),
+                enc: enc.clone(),
+                exported: exported.clone(),
+            });
+        }
+
+        Ok((enc, exported))
     }
 
     /// 6. Single-Shot APIs
@@ -843,9 +839,12 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// such that it doesn't make sense to deserialize before passing it in.
     ///
     /// Returns the exporter secret for the given exporter context and length.
+    ///
+    /// When the `verif` feature is enabled, a `ReceivedExport` event is appended
+    /// to the instance's event log.
     #[allow(clippy::too_many_arguments)]
     pub fn receiver_export(
-        &self,
+        &mut self,
         enc: &[u8],
         sk_r: &HpkePrivateKey,
         info: &[u8],
@@ -856,7 +855,20 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
         length: usize,
     ) -> Result<Vec<u8>, HpkeError> {
         let context = self.setup_receiver(enc, sk_r, info, psk, psk_id, pk_s)?;
-        context.export(exporter_context, length)
+        let exported = context.export(exporter_context, length)?;
+
+        #[cfg(feature = "verif")]
+        {
+            self.log.push(Event::ReceivedExport {
+                mode: self.mode,
+                recipient_sk: sk_r.value.clone(),
+                sender_pk: pk_s.cloned(),
+                enc: enc.to_vec(),
+                exported: exported.clone(),
+            });
+        }
+
+        Ok(exported)
     }
 
     /// Verify PSKs.
@@ -1009,6 +1021,12 @@ impl<Crypto: HpkeCrypto> Hpke<Crypto> {
     /// Get the rng.
     pub(crate) fn rng(&mut self) -> &mut Crypto::HpkePrng {
         &mut self.prng
+    }
+
+    /// Get a reference to the verification event log.
+    #[cfg(feature = "verif")]
+    pub fn log(&self) -> &[Event] {
+        &self.log
     }
 }
 
@@ -1186,69 +1204,6 @@ impl tls_codec::Deserialize for &HpkePublicKey {
             "Error trying to deserialize a reference.".to_string(),
         ))
     }
-}
-
-/// Verification main function for Aeneas.
-/// Orchestrates seal and open operations in a loop with local logging.
-#[cfg(feature = "verif")]
-pub fn verify_hpke<Crypto: HpkeCrypto + 'static>(
-    iterations: usize,
-) -> Result<Vec<VerifLogEntry>, HpkeError> {
-    let mut hpke = Hpke::<Crypto>::new(
-        Mode::Base,
-        KemAlgorithm::DhKem25519,
-        KdfAlgorithm::HkdfSha256,
-        AeadAlgorithm::ChaCha20Poly1305,
-    );
-
-    // Generate keys once
-    let (sk_r, pk_r) = hpke.generate_key_pair()?.into_keys();
-
-    let info = b"verification info";
-    let aad = b"verification aad";
-    let plaintext = b"verification plaintext";
-
-    let mut log: Vec<VerifLogEntry> = Vec::new();
-    let mut iteration = 0;
-
-    loop {
-        if iteration >= iterations {
-            break;
-        }
-
-        let action = match hpke.random(1) {
-            Ok(bytes) => usize::from(bytes[0] % 3),
-            Err(_) => 0,
-        };
-
-        if action == 0 {
-            // Seal operation with logging
-            match hpke.seal(&pk_r, info, aad, plaintext, None, None, None, &mut log) {
-                Ok((enc, ct)) => log.push(VerifLogEntry::Message((enc, ct))),
-                Err(_) => {}
-            }
-        } else if action == 1 {
-            // Get the last seal's enc and ciphertext
-            if let Some(VerifLogEntry::Message((enc, ct))) = log.last() {
-                let last_enc = enc.clone();
-                let last_ct = ct.clone();
-
-                // Open operation with logging
-                let _ = hpke.open(&last_enc, &sk_r, info, aad, &last_ct, None, None, None, &mut log);
-            }
-        } else {
-            // Inject a random message tuple.
-            if let Ok(enc) = hpke.random(32) {
-                if let Ok(ct) = hpke.random(32) {
-                    log.push(VerifLogEntry::Message((enc, ct)));
-                }
-            }
-        }
-
-        iteration += 1;
-    }
-
-    Ok(log)
 }
 
 /// Test util module. Should be moved really.

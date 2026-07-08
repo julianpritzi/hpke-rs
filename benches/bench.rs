@@ -233,7 +233,7 @@ fn benchmark<Crypto: HpkeCrypto + 'static>(c: &mut Criterion) {
 
                                     (hpke, aad, ctxt, enc)
                                 },
-                                |(hpke, aad, ctxt, enc)| {
+                                |(mut hpke, aad, ctxt, enc)| {
                                     let _ctxt_out = hpke
                                         .open(
                                             &enc,
